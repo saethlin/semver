@@ -70,22 +70,62 @@ use crate::alloc::alloc::{alloc, dealloc, Layout};
 #[cfg(no_from_ne_bytes)]
 use crate::backport::FromNeBytes;
 use core::mem;
-use core::num::{NonZeroU64, NonZeroUsize};
+use core::num::NonZeroUsize;
 use core::ptr;
+use core::ptr::NonNull;
 use core::slice;
 use core::str;
 
 #[repr(transparent)]
 pub(crate) struct Identifier {
-    repr: NonZeroU64,
+    repr: Repr,
+}
+
+use crate::identifier::repr::Repr;
+
+mod repr {
+    use core::mem::MaybeUninit;
+    use core::ptr::NonNull;
+
+    #[derive(Clone, Copy)]
+    pub struct Repr([MaybeUninit<u8>; 8]);
+
+    impl PartialEq for Repr {
+        fn eq(&self, other: &Self) -> bool {
+            self.as_ptr() == other.as_ptr()
+        }
+    }
+
+    impl Eq for Repr {}
+
+    impl Repr {
+        pub const EMPTY: Repr = Repr([MaybeUninit::new(255u8); 8]);
+
+        pub fn as_ptr(self) -> *const u8 {
+            unsafe { core::mem::transmute(self.0) }
+        }
+
+        pub fn from_ptr(ptr: NonNull<u8>) -> Self {
+            Repr(unsafe { core::mem::transmute(ptr) })
+        }
+
+        pub unsafe fn from_inline(bytes: u64) -> Repr {
+            Repr(unsafe { core::mem::transmute(bytes) })
+        }
+
+        pub fn is_inline(self) -> bool {
+            // `test rdi, rdi` -- basically: `self as i64 >= 0`
+            self.as_ptr() as usize >> 63 == 0
+        }
+    }
 }
 
 impl Identifier {
-    const EMPTY: NonZeroU64 = unsafe { NonZeroU64::new_unchecked(!0) };
+    const EMPTY: Repr = Repr::EMPTY;
 
     pub(crate) const fn empty() -> Self {
         // `mov rax, -1`
-        Identifier { repr: Self::EMPTY }
+        Identifier { repr: Repr::EMPTY }
     }
 
     // SAFETY: string must be ASCII and not contain \0 bytes.
@@ -100,7 +140,7 @@ impl Identifier {
                 unsafe { ptr::copy_nonoverlapping(string.as_ptr(), bytes.as_mut_ptr(), len) };
                 // SAFETY: it's nonzero because the input string was at least 1
                 // byte of ASCII and did not contain \0.
-                unsafe { NonZeroU64::new_unchecked(u64::from_ne_bytes(bytes)) }
+                unsafe { Repr::from_inline(u64::from_ne_bytes(bytes)) }
             }
             9..=0xff_ffff_ffff_ffff => {
                 // SAFETY: len is in a range that does not contain 0.
@@ -141,8 +181,7 @@ impl Identifier {
     }
 
     fn is_inline(&self) -> bool {
-        // `test rdi, rdi` -- basically: `repr as i64 >= 0`
-        self.repr.get() >> 63 == 0
+        self.repr.is_inline()
     }
 
     fn is_empty_or_inline(&self) -> bool {
@@ -228,38 +267,41 @@ impl PartialEq for Identifier {
 // insignificant 0 in the least significant bit. We take advantage of that
 // unneeded bit to rotate a 1 into the most significant bit to make the repr
 // distinguishable from ASCII bytes.
-fn ptr_to_repr(ptr: *mut u8) -> NonZeroU64 {
+fn ptr_to_repr(ptr: *mut u8) -> Repr {
     // `mov eax, 1`
     // `shld rax, rdi, 63`
-    let repr = (ptr as u64 | 1).rotate_right(1);
+    let prev = ptr as usize;
+    let repr = (prev | 1).rotate_right(1);
 
     // SAFETY: the most significant bit of repr is known to be set, so the value
     // is not zero.
-    unsafe { NonZeroU64::new_unchecked(repr) }
+    Repr::from_ptr(unsafe { NonNull::new_unchecked(ptr.wrapping_sub(prev).wrapping_add(repr)) })
 }
 
 // Shift out the 1 previously placed into the most significant bit of the least
 // significant byte. Shift in a low 0 bit to reconstruct the original 2-byte
 // aligned pointer.
-fn repr_to_ptr(repr: NonZeroU64) -> *const u8 {
+fn repr_to_ptr(repr: Repr) -> *const u8 {
     // `lea rax, [rdi + rdi]`
-    (repr.get() << 1) as *const u8
+    let int_repr = repr.as_ptr() as usize;
+    repr.as_ptr()
+        .wrapping_sub(int_repr)
+        .wrapping_add(int_repr << 1)
 }
 
-fn repr_to_ptr_mut(repr: NonZeroU64) -> *mut u8 {
+fn repr_to_ptr_mut(repr: Repr) -> *mut u8 {
     repr_to_ptr(repr) as *mut u8
 }
 
 // Compute the length of the inline string, assuming the argument is in short
 // string representation. Short strings are stored as 1 to 8 nonzero ASCII
 // bytes, followed by \0 padding for the remaining bytes.
-fn inline_len(repr: NonZeroU64) -> NonZeroUsize {
+fn inline_len(repr: Repr) -> NonZeroUsize {
     // Rustc >=1.53 has intrinsics for counting zeros on a non-zeroable integer.
     // On many architectures these are more efficient than counting on ordinary
     // zeroable integers (bsf vs cttz). On rustc <1.53 without those intrinsics,
     // we count zeros in the u64 rather than the NonZeroU64.
-    #[cfg(no_nonzero_bitscan)]
-    let repr = repr.get();
+    let repr = repr.as_ptr() as usize;
 
     #[cfg(target_endian = "little")]
     let zero_bits_on_string_end = repr.leading_zeros();
@@ -275,8 +317,8 @@ fn inline_len(repr: NonZeroU64) -> NonZeroUsize {
 
 // SAFETY: repr must be in the inline representation, i.e. at least 1 and at
 // most 8 nonzero ASCII bytes padded on the end with \0 bytes.
-unsafe fn inline_as_str(repr: &NonZeroU64) -> &str {
-    let ptr = repr as *const NonZeroU64 as *const u8;
+unsafe fn inline_as_str(repr: &Repr) -> &str {
+    let ptr = repr as *const Repr as *const u8;
     let len = inline_len(*repr).get();
     // SAFETY: we are viewing the nonzero ASCII prefix of the inline repr's
     // contents as a slice of bytes. Input/output lifetimes are correctly
@@ -335,7 +377,7 @@ unsafe fn decode_len(ptr: *const u8) -> NonZeroUsize {
 
 // SAFETY: repr must be in the heap allocated representation, with varint header
 // and string contents already written.
-unsafe fn ptr_as_str(repr: &NonZeroU64) -> &str {
+unsafe fn ptr_as_str(repr: &Repr) -> &str {
     let ptr = repr_to_ptr(*repr);
     let len = unsafe { decode_len(ptr) };
     let header = bytes_for_varint(len);
